@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>進行役 コントロール画面</title>
+<link rel="stylesheet" href="../shared/style.css">
+</head>
+<body>
+<div class="wrap">
+  <h1>🎤 進行役コントロール</h1>
+  <div id="content"></div>
+</div>
+
+<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-database-compat.js"></script>
+<script src="../shared/firebase-config.js"></script>
+<script>
+const content = document.getElementById("content");
+let questions = [];
+let roomCode = sessionStorage.getItem("host_room") || "";
+let hostKey = sessionStorage.getItem("host_key") || "";
+
+function genCode() {
+  return String(Math.floor(1000 + Math.random() * 9000));
+}
+
+function renderCreate() {
+  content.innerHTML = `
+    <div class="card">
+      <h2>大会を作成</h2>
+      <p class="muted">進行画面を操作するための合言葉を決めてください（当日、他の人に操作されないようにするためのものです）</p>
+      <input class="big-input" id="keyInput" placeholder="合言葉（例：あいことば2026）">
+      <button id="createBtn">大会を作成する</button>
+    </div>
+    <div class="card">
+      <h2>すでに作成した大会に戻る</h2>
+      <input class="big-input" id="codeInput" placeholder="参加コード（4桁）">
+      <input class="big-input" id="keyInput2" placeholder="合言葉">
+      <button class="secondary" id="resumeBtn">戻る</button>
+    </div>
+  `;
+  document.getElementById("createBtn").onclick = () => {
+    const key = document.getElementById("keyInput").value.trim();
+    if (!key) { alert("合言葉を入力してください"); return; }
+    const code = genCode();
+    db.ref(`rooms/${code}`).set({
+      createdAt: firebase.database.ServerValue.TIMESTAMP,
+      hostKey: key,
+      state: { phase: "lobby", qIndex: -1 }
+    }).then(() => {
+      roomCode = code; hostKey = key;
+      sessionStorage.setItem("host_room", roomCode);
+      sessionStorage.setItem("host_key", hostKey);
+      loadQuestionsAndRun();
+    });
+  };
+  document.getElementById("resumeBtn").onclick = () => {
+    const code = document.getElementById("codeInput").value.trim();
+    const key = document.getElementById("keyInput2").value.trim();
+    db.ref(`rooms/${code}`).once("value", (snap) => {
+      const room = snap.val();
+      if (!room || room.hostKey !== key) { alert("参加コードか合言葉が違います"); return; }
+      roomCode = code; hostKey = key;
+      sessionStorage.setItem("host_room", roomCode);
+      sessionStorage.setItem("host_key", hostKey);
+      loadQuestionsAndRun();
+    });
+  };
+}
+
+function loadQuestionsAndRun() {
+  fetch("../questions/sample.json").then(r => r.json()).then(qs => {
+    questions = qs;
+    runControl();
+  });
+}
+
+function runControl() {
+  renderControlPanel();
+  db.ref(`rooms/${roomCode}/players`).on("value", (snap) => {
+    const players = snap.val() || {};
+    const count = Object.keys(players).length;
+    const el = document.getElementById("playerCount");
+    if (el) el.textContent = count;
+  });
+  db.ref(`rooms/${roomCode}/state`).on("value", (snap) => {
+    const state = snap.val();
+    const el = document.getElementById("phaseLabel");
+    if (el && state) el.textContent = `フェーズ：${state.phase}　問題番号：${state.qIndex + 1}/${questions.length}`;
+  });
+}
+
+function renderControlPanel() {
+  content.innerHTML = `
+    <div class="card">
+      <h2>参加コード：${roomCode}</h2>
+      <p>参加者用URLに <code>?room=${roomCode}</code> を付けて共有するか、参加コードを口頭で伝えてください。</p>
+      <p>大画面には <code>/screen/?room=${roomCode}</code> を表示してください。</p>
+      <p>現在の参加人数：<span id="playerCount">0</span> 人</p>
+      <p class="muted" id="phaseLabel"></p>
+    </div>
+    <div class="card">
+      <h2>進行操作</h2>
+      <button id="nextBtn">▶ 次の問題へ</button>
+      <button class="secondary" id="revealBtn">✅ 正解を見せる（採点する）</button>
+      <button class="secondary" id="rankBtn">🏅 順位を見せる</button>
+      <button class="accent" id="endBtn">🎊 大会を終了（最終結果・表彰）</button>
+    </div>
+  `;
+  document.getElementById("nextBtn").onclick = nextQuestion;
+  document.getElementById("revealBtn").onclick = revealAnswer;
+  document.getElementById("rankBtn").onclick = showRanking;
+  document.getElementById("endBtn").onclick = endEvent;
+}
+
+function nextQuestion() {
+  db.ref(`rooms/${roomCode}/state/qIndex`).once("value", (snap) => {
+    const current = snap.val();
+    const nextIndex = (current === null || current === undefined) ? 0 : current + 1;
+    if (nextIndex >= questions.length) { alert("すべての問題が終わりました。「大会を終了」を押してください。"); return; }
+    const q = questions[nextIndex];
+    db.ref(`rooms/${roomCode}/state`).set({
+      phase: "question",
+      qIndex: nextIndex,
+      currentQuestion: q,
+      questionStartedAt: Date.now()
+    });
+  });
+}
+
+function revealAnswer() {
+  db.ref(`rooms/${roomCode}/state`).once("value", (snap) => {
+    const state = snap.val();
+    const q = state.currentQuestion;
+    const qIndex = state.qIndex;
+
+    // 採点済みかどうかを確認（二重採点防止）
+    db.ref(`rooms/${roomCode}/scored/${qIndex}`).once("value", (scoredSnap) => {
+      const already = scoredSnap.val();
+      const proceed = () => {
+        db.ref(`rooms/${roomCode}/state`).update({ phase: "reveal" });
+      };
+      if (already || q.practice) { proceed(); return; }
+
+      db.ref(`rooms/${roomCode}/answers/${qIndex}`).once("value", (ansSnap) => {
+        const answers = ansSnap.val() || {};
+        const timeLimit = (q.timeLimit || 20) * 1000;
+        const updates = {};
+        Object.entries(answers).forEach(([playerId, a]) => {
+          const correct = a.choice === q.answerIndex;
+          let points = 0;
+          if (correct) {
+            const speedBonus = Math.max(0, Math.round(200 * (1 - a.elapsedMs / timeLimit)));
+            points = 1000 + speedBonus;
+          }
+          updates[`players/${playerId}/score`] = firebase.database.ServerValue.increment(points);
+        });
+        const dbRoot = db.ref(`rooms/${roomCode}`);
+        dbRoot.update(updates).then(() => {
+          db.ref(`rooms/${roomCode}/scored/${qIndex}`).set(true);
+          proceed();
+        });
+      });
+    });
+  });
+}
+
+function showRanking() {
+  db.ref(`rooms/${roomCode}/state`).update({ phase: "results" });
+}
+
+function endEvent() {
+  db.ref(`rooms/${roomCode}/players`).once("value", (snap) => {
+    const players = snap.val() || {};
+    const teams = {};
+    Object.values(players).forEach(p => {
+      if (!teams[p.team]) teams[p.team] = { totalScore: 0, count: 0, totalSpeedBonus: 0 };
+      teams[p.team].totalScore += (p.score || 0);
+      teams[p.team].count += 1;
+    });
+    const teamAverages = Object.entries(teams).map(([team, t]) => ({
+      team, avg: t.count ? t.totalScore / t.count : 0
+    }));
+    teamAverages.sort((a, b) => b.avg - a.avg);
+    const champion = teamAverages[0] ? teamAverages[0].team : null;
+    const last = teamAverages[teamAverages.length - 1] ? teamAverages[teamAverages.length - 1].team : null;
+    // 簡易版：最速回答チームは、平均得点2位のチームを暫定表示（正式な速度集計は今後の改修で対応）
+    const fastest = teamAverages[1] ? teamAverages[1].team : champion;
+
+    db.ref(`rooms/${roomCode}/state`).update({
+      phase: "ended",
+      finalTeamResults: { champion, fastest, mostFun: last }
+    }).then(() => {
+      alert("大会を終了しました。大画面と参加者画面に最終結果が表示されます。");
+    });
+  });
+}
+
+if (roomCode && hostKey) {
+  db.ref(`rooms/${roomCode}`).once("value", (snap) => {
+    const room = snap.val();
+    if (room && room.hostKey === hostKey) loadQuestionsAndRun();
+    else renderCreate();
+  });
+} else {
+  renderCreate();
+}
+</script>
+</body>
+</html>

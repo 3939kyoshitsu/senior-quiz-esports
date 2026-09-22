@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>クイズに参加</title>
+<link rel="stylesheet" href="../shared/style.css">
+</head>
+<body>
+<div class="wrap" id="app">
+  <h1>🎉 クイズ大会</h1>
+  <p class="center muted" id="roomLabel"></p>
+  <div id="content"></div>
+</div>
+
+<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-database-compat.js"></script>
+<script src="../shared/firebase-config.js"></script>
+<script>
+const content = document.getElementById("content");
+const roomLabel = document.getElementById("roomLabel");
+
+const params = new URLSearchParams(location.search);
+let roomCode = params.get("room") || localStorage.getItem("quiz_room") || "";
+
+function saveIdentity(room, playerId) {
+  localStorage.setItem("quiz_room", room);
+  localStorage.setItem("quiz_playerId_" + room, playerId);
+}
+function getPlayerId(room) {
+  return localStorage.getItem("quiz_playerId_" + room);
+}
+
+// スマホが自動でスリープしないようにする（対応端末のみ）
+let wakeLock = null;
+async function keepAwake() {
+  try {
+    if ("wakeLock" in navigator) {
+      wakeLock = await navigator.wakeLock.request("screen");
+    }
+  } catch (e) { /* 対応していない端末では何もしない */ }
+}
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") keepAwake();
+});
+
+function renderRoomEntry() {
+  content.innerHTML = `
+    <div class="card">
+      <h2>参加コードを入力</h2>
+      <input class="big-input" id="roomInput" placeholder="例：1234" inputmode="numeric" maxlength="4">
+      <button id="goBtn">次へ進む</button>
+    </div>
+  `;
+  document.getElementById("goBtn").onclick = () => {
+    const v = document.getElementById("roomInput").value.trim();
+    if (!v) return;
+    roomCode = v;
+    localStorage.setItem("quiz_room", roomCode);
+    start();
+  };
+}
+
+function renderJoinForm() {
+  roomLabel.textContent = "参加コード：" + roomCode;
+  content.innerHTML = `
+    <div class="card">
+      <h2>ニックネームを入力してください</h2>
+      <input class="big-input" id="nameInput" placeholder="例：たなか" maxlength="12">
+      <h2>チームを選んでください</h2>
+      <select class="big-input" id="teamInput">
+        <option value="A卓">A卓</option>
+        <option value="B卓">B卓</option>
+        <option value="C卓">C卓</option>
+        <option value="D卓">D卓</option>
+        <option value="E卓">E卓</option>
+      </select>
+      <button id="joinBtn">参加する</button>
+    </div>
+  `;
+  document.getElementById("joinBtn").onclick = () => {
+    const name = document.getElementById("nameInput").value.trim();
+    const team = document.getElementById("teamInput").value;
+    if (!name) { alert("ニックネームを入力してください"); return; }
+    joinRoom(name, team);
+  };
+}
+
+function joinRoom(name, team) {
+  const ref = db.ref(`rooms/${roomCode}/players`).push();
+  ref.set({
+    name, team, score: 0,
+    joinedAt: firebase.database.ServerValue.TIMESTAMP
+  }).then(() => {
+    saveIdentity(roomCode, ref.key);
+    keepAwake();
+    listenState();
+  });
+}
+
+let currentPhase = null;
+let currentQIndex = null;
+let answered = false;
+
+function listenState() {
+  const playerId = getPlayerId(roomCode);
+  db.ref(`rooms/${roomCode}/state`).on("value", (snap) => {
+    const state = snap.val();
+    if (!state) { renderWaitingForHost(); return; }
+    currentPhase = state.phase;
+    currentQIndex = state.qIndex;
+    if (state.phase === "lobby") renderLobby(state);
+    else if (state.phase === "question") renderQuestion(state);
+    else if (state.phase === "reveal") renderReveal(state, playerId);
+    else if (state.phase === "results") renderResults(state, playerId);
+    else if (state.phase === "ended") renderEnded(state, playerId);
+  });
+}
+
+function renderWaitingForHost() {
+  content.innerHTML = `<div class="card center"><p>大会の開始を待っています…</p></div>`;
+}
+
+function renderLobby(state) {
+  content.innerHTML = `
+    <div class="card center">
+      <p>参加登録が完了しました✨</p>
+      <p>まもなく大会が始まります。このまましばらくお待ちください。</p>
+    </div>
+  `;
+}
+
+let timerInterval = null;
+
+function renderQuestion(state) {
+  answered = false;
+  const q = state.currentQuestion;
+  if (!q) return;
+  const choicesHtml = q.choices.map((c, i) =>
+    `<button class="choice-btn" data-i="${i}">${c}</button>`
+  ).join("");
+
+  content.innerHTML = `
+    <div class="card">
+      <p class="muted">問題 ${state.qIndex + 1}${q.practice ? "（練習）" : ""}</p>
+      <p style="font-size:1.2em; font-weight:bold;">${q.question}</p>
+      <div id="choices">${choicesHtml}</div>
+      <div class="timer" id="timerBox">--</div>
+      <button class="accent" id="confirmBtn" disabled>これで決定</button>
+    </div>
+  `;
+
+  let selected = null;
+  document.querySelectorAll(".choice-btn").forEach(btn => {
+    btn.onclick = () => {
+      if (answered) return;
+      document.querySelectorAll(".choice-btn").forEach(b => b.classList.remove("selected"));
+      btn.classList.add("selected");
+      selected = parseInt(btn.dataset.i, 10);
+      document.getElementById("confirmBtn").disabled = false;
+    };
+  });
+
+  document.getElementById("confirmBtn").onclick = () => {
+    if (selected === null || answered) return;
+    answered = true;
+    document.getElementById("confirmBtn").disabled = true;
+    document.getElementById("confirmBtn").textContent = "回答しました！";
+    const playerId = getPlayerId(roomCode);
+    const elapsedMs = Date.now() - (state.questionStartedAt || Date.now());
+    db.ref(`rooms/${roomCode}/answers/${state.qIndex}/${playerId}`).set({
+      choice: selected,
+      elapsedMs
+    });
+  };
+
+  if (timerInterval) clearInterval(timerInterval);
+  const timeLimit = q.timeLimit || 20;
+  const startedAt = state.questionStartedAt || Date.now();
+  timerInterval = setInterval(() => {
+    const remain = Math.max(0, timeLimit - Math.floor((Date.now() - startedAt) / 1000));
+    const box = document.getElementById("timerBox");
+    if (box) box.textContent = remain + " 秒";
+    if (remain <= 0) clearInterval(timerInterval);
+  }, 200);
+}
+
+function renderReveal(state, playerId) {
+  if (timerInterval) clearInterval(timerInterval);
+  const q = state.currentQuestion;
+  db.ref(`rooms/${roomCode}/answers/${state.qIndex}/${playerId}`).once("value", (snap) => {
+    const mine = snap.val();
+    const correct = mine && mine.choice === q.answerIndex;
+    content.innerHTML = `
+      <div class="card center">
+        <p class="muted">問題 ${state.qIndex + 1} の結果</p>
+        <p style="font-size:1.4em; font-weight:bold; color:${correct ? "#2f9e44" : "#c92a2a"};">
+          ${mine ? (correct ? "正解です！🎉" : "残念、不正解でした") : "回答なし"}
+        </p>
+        <p>正解：${q.choices[q.answerIndex]}</p>
+        <p class="muted">${q.explanation || ""}</p>
+      </div>
+    `;
+  });
+}
+
+function renderResults(state, playerId) {
+  db.ref(`rooms/${roomCode}/players`).once("value", (snap) => {
+    const players = snap.val() || {};
+    const list = Object.entries(players).map(([id, p]) => ({ id, ...p }));
+    list.sort((a, b) => (b.score || 0) - (a.score || 0));
+    const myRank = list.findIndex(p => p.id === playerId) + 1;
+    const top5 = list.slice(0, 5);
+    const rows = top5.map((p, i) =>
+      `<div class="rank-row"><span class="pos">${i + 1}位</span><span>${p.name}</span><span class="score">${p.score || 0}点</span></div>`
+    ).join("");
+    content.innerHTML = `
+      <div class="card">
+        <h2 class="center">現在の順位</h2>
+        ${rows}
+        <p class="center muted">あなたは ${myRank || "-"} 位です</p>
+      </div>
+    `;
+  });
+}
+
+function renderEnded(state, playerId) {
+  const awards = state.finalTeamResults;
+  db.ref(`rooms/${roomCode}/players/${playerId}`).once("value", (snap) => {
+    const me = snap.val() || {};
+    content.innerHTML = `
+      <div class="card center">
+        <h2>お疲れさまでした！🎊</h2>
+        <p>${me.name} さん（${me.team}）</p>
+        <p>合計 ${me.score || 0} 点</p>
+        ${awards ? `
+          <hr>
+          <p>🏆 優勝チーム：${awards.champion || "-"}</p>
+          <p>⚡ 最速回答チーム：${awards.fastest || "-"}</p>
+          <p>😄 わきあいあい賞：${awards.mostFun || "-"}</p>
+        ` : ""}
+        <p class="muted">ご参加ありがとうございました！</p>
+      </div>
+    `;
+  });
+}
+
+function start() {
+  const playerId = getPlayerId(roomCode);
+  db.ref(`rooms/${roomCode}`).once("value", (snap) => {
+    if (!snap.exists()) {
+      content.innerHTML = `<div class="card center"><p>その参加コードの大会が見つかりません。進行役の方にご確認ください。</p></div>`;
+      return;
+    }
+    if (playerId) {
+      db.ref(`rooms/${roomCode}/players/${playerId}`).once("value", (pSnap) => {
+        if (pSnap.exists()) { roomLabel.textContent = "参加コード：" + roomCode; keepAwake(); listenState(); }
+        else renderJoinForm();
+      });
+    } else {
+      renderJoinForm();
+    }
+  });
+}
+
+if (roomCode) start(); else renderRoomEntry();
+</script>
+</body>
+</html>
