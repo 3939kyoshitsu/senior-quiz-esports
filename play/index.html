@@ -31,6 +31,15 @@ function getPlayerId(room) {
   return localStorage.getItem("quiz_playerId_" + room);
 }
 
+// 大画面・進行役画面と時刻のズレが出ないよう、Firebaseサーバーとの時刻差を取得しておく
+let serverTimeOffset = 0;
+db.ref(".info/serverTimeOffset").on("value", (snap) => {
+  serverTimeOffset = snap.val() || 0;
+});
+function serverNow() {
+  return Date.now() + serverTimeOffset;
+}
+
 // スマホが自動でスリープしないようにする（対応端末のみ）
 let wakeLock = null;
 async function keepAwake() {
@@ -167,7 +176,7 @@ function renderQuestion(state) {
     document.getElementById("confirmBtn").disabled = true;
     document.getElementById("confirmBtn").textContent = "回答しました！";
     const playerId = getPlayerId(roomCode);
-    const elapsedMs = Date.now() - (state.questionStartedAt || Date.now());
+    const elapsedMs = serverNow() - (state.questionStartedAt || serverNow());
     db.ref(`rooms/${roomCode}/answers/${state.qIndex}/${playerId}`).set({
       choice: selected,
       elapsedMs
@@ -176,9 +185,9 @@ function renderQuestion(state) {
 
   if (timerInterval) clearInterval(timerInterval);
   const timeLimit = q.timeLimit || 20;
-  const startedAt = state.questionStartedAt || Date.now();
+  const startedAt = state.questionStartedAt || serverNow();
   timerInterval = setInterval(() => {
-    const remain = Math.max(0, timeLimit - Math.floor((Date.now() - startedAt) / 1000));
+    const remain = Math.max(0, timeLimit - Math.floor((serverNow() - startedAt) / 1000));
     const box = document.getElementById("timerBox");
     if (box) box.textContent = remain + " 秒";
     if (remain <= 0) clearInterval(timerInterval);

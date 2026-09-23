@@ -21,6 +21,15 @@ let questions = [];
 let roomCode = sessionStorage.getItem("host_room") || "";
 let hostKey = sessionStorage.getItem("host_key") || "";
 
+// 参加者・大画面と時刻のズレが出ないよう、Firebaseサーバーとの時刻差を取得しておく
+let serverTimeOffset = 0;
+db.ref(".info/serverTimeOffset").on("value", (snap) => {
+  serverTimeOffset = snap.val() || 0;
+});
+function serverNow() {
+  return Date.now() + serverTimeOffset;
+}
+
 function genCode() {
   return String(Math.floor(1000 + Math.random() * 9000));
 }
@@ -76,29 +85,67 @@ function loadQuestionsAndRun() {
   });
 }
 
+let totalPlayers = 0;
+let answeredCount = 0;
+let answersListenerRef = null;
+let currentQIndexForAnswers = null;
+let lastPhase = null;
+
+function updateAnsweredLabel(phase) {
+  const el = document.getElementById("answeredLabel");
+  if (!el) return;
+  if (phase === "question") {
+    el.textContent = `回答状況：${answeredCount} / ${totalPlayers} 人が回答済み`;
+  } else {
+    el.textContent = "";
+  }
+}
+
 function runControl() {
   renderControlPanel();
   db.ref(`rooms/${roomCode}/players`).on("value", (snap) => {
     const players = snap.val() || {};
-    const count = Object.keys(players).length;
+    totalPlayers = Object.keys(players).length;
     const el = document.getElementById("playerCount");
-    if (el) el.textContent = count;
+    if (el) el.textContent = totalPlayers;
+    updateAnsweredLabel(lastPhase);
   });
   db.ref(`rooms/${roomCode}/state`).on("value", (snap) => {
     const state = snap.val();
+    if (!state) return;
+    lastPhase = state.phase;
     const el = document.getElementById("phaseLabel");
-    if (el && state) el.textContent = `フェーズ：${state.phase}　問題番号：${state.qIndex + 1}/${questions.length}`;
+    if (el) el.textContent = `フェーズ：${state.phase}　問題番号：${state.qIndex + 1}/${questions.length}`;
+
+    // 出題中の問題が変わったら、回答状況の集計先を切り替える
+    if (state.qIndex !== currentQIndexForAnswers) {
+      currentQIndexForAnswers = state.qIndex;
+      if (answersListenerRef) answersListenerRef.off();
+      answeredCount = 0;
+      if (state.qIndex >= 0) {
+        answersListenerRef = db.ref(`rooms/${roomCode}/answers/${state.qIndex}`);
+        answersListenerRef.on("value", (ansSnap) => {
+          const answers = ansSnap.val() || {};
+          answeredCount = Object.keys(answers).length;
+          updateAnsweredLabel(lastPhase);
+        });
+      }
+    }
+    updateAnsweredLabel(state.phase);
   });
 }
 
 function renderControlPanel() {
+  const screenUrl = `../screen/?room=${roomCode}`;
   content.innerHTML = `
     <div class="card">
       <h2>参加コード：${roomCode}</h2>
       <p>参加者用URLに <code>?room=${roomCode}</code> を付けて共有するか、参加コードを口頭で伝えてください。</p>
-      <p>大画面には <code>/screen/?room=${roomCode}</code> を表示してください。</p>
+      <button class="outline" id="openScreenBtn" type="button">🖥 大画面用の画面を開く（別タブ）</button>
+      <p class="muted">うまく開かない場合は、このURLを大画面用のパソコンで直接開いてください：<br><code>${screenUrl}</code></p>
       <p>現在の参加人数：<span id="playerCount">0</span> 人</p>
       <p class="muted" id="phaseLabel"></p>
+      <p class="muted" id="answeredLabel"></p>
     </div>
     <div class="card">
       <h2>進行操作</h2>
@@ -108,6 +155,9 @@ function renderControlPanel() {
       <button class="accent" id="endBtn">🎊 大会を終了（最終結果・表彰）</button>
     </div>
   `;
+  document.getElementById("openScreenBtn").onclick = () => {
+    window.open(screenUrl, "_blank", "noopener");
+  };
   document.getElementById("nextBtn").onclick = nextQuestion;
   document.getElementById("revealBtn").onclick = revealAnswer;
   document.getElementById("rankBtn").onclick = showRanking;
@@ -124,7 +174,7 @@ function nextQuestion() {
       phase: "question",
       qIndex: nextIndex,
       currentQuestion: q,
-      questionStartedAt: Date.now()
+      questionStartedAt: serverNow()
     });
   });
 }

@@ -20,6 +20,15 @@ const content = document.getElementById("content");
 const params = new URLSearchParams(location.search);
 const roomCode = params.get("room");
 
+// 参加者・進行役画面と時刻のズレが出ないよう、Firebaseサーバーとの時刻差を取得しておく
+let serverTimeOffset = 0;
+db.ref(".info/serverTimeOffset").on("value", (snap) => {
+  serverTimeOffset = snap.val() || 0;
+});
+function serverNow() {
+  return Date.now() + serverTimeOffset;
+}
+
 if (!roomCode) {
   content.innerHTML = `<div class="card center"><p>URLの最後に <code>?room=参加コード</code> を付けて開いてください。</p></div>`;
 } else {
@@ -71,9 +80,9 @@ function renderQuestion(state) {
   `;
   if (timerInterval) clearInterval(timerInterval);
   const timeLimit = q.timeLimit || 20;
-  const startedAt = state.questionStartedAt || Date.now();
+  const startedAt = state.questionStartedAt || serverNow();
   timerInterval = setInterval(() => {
-    const remain = Math.max(0, timeLimit - Math.floor((Date.now() - startedAt) / 1000));
+    const remain = Math.max(0, timeLimit - Math.floor((serverNow() - startedAt) / 1000));
     const box = document.getElementById("timerBox");
     if (box) box.textContent = remain + " 秒";
     if (remain <= 0) clearInterval(timerInterval);
