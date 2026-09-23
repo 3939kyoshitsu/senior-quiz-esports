@@ -150,11 +150,14 @@ function revealAnswer() {
         Object.entries(answers).forEach(([playerId, a]) => {
           const correct = a.choice === q.answerIndex;
           let points = 0;
+          let speedBonus = 0;
           if (correct) {
-            const speedBonus = Math.max(0, Math.round(200 * (1 - a.elapsedMs / timeLimit)));
+            speedBonus = Math.max(0, Math.round(200 * (1 - a.elapsedMs / timeLimit)));
             points = 1000 + speedBonus;
           }
           updates[`players/${playerId}/score`] = firebase.database.ServerValue.increment(points);
+          // 「最速回答チーム」の判定に使う、スピードボーナスの累計（正解した問題のみ加算）
+          updates[`players/${playerId}/speedBonusTotal`] = firebase.database.ServerValue.increment(speedBonus);
         });
         const dbRoot = db.ref(`rooms/${roomCode}`);
         dbRoot.update(updates).then(() => {
@@ -175,18 +178,24 @@ function endEvent() {
     const players = snap.val() || {};
     const teams = {};
     Object.values(players).forEach(p => {
-      if (!teams[p.team]) teams[p.team] = { totalScore: 0, count: 0, totalSpeedBonus: 0 };
+      if (!teams[p.team]) teams[p.team] = { totalScore: 0, totalSpeedBonus: 0, count: 0 };
       teams[p.team].totalScore += (p.score || 0);
+      teams[p.team].totalSpeedBonus += (p.speedBonusTotal || 0);
       teams[p.team].count += 1;
     });
-    const teamAverages = Object.entries(teams).map(([team, t]) => ({
-      team, avg: t.count ? t.totalScore / t.count : 0
-    }));
-    teamAverages.sort((a, b) => b.avg - a.avg);
-    const champion = teamAverages[0] ? teamAverages[0].team : null;
-    const last = teamAverages[teamAverages.length - 1] ? teamAverages[teamAverages.length - 1].team : null;
-    // 簡易版：最速回答チームは、平均得点2位のチームを暫定表示（正式な速度集計は今後の改修で対応）
-    const fastest = teamAverages[1] ? teamAverages[1].team : champion;
+
+    // 優勝チーム：チーム得点（平均点）が最も高いチーム
+    const byScore = Object.entries(teams)
+      .map(([team, t]) => ({ team, avg: t.count ? t.totalScore / t.count : 0 }))
+      .sort((a, b) => b.avg - a.avg);
+    const champion = byScore[0] ? byScore[0].team : null;
+    const last = byScore[byScore.length - 1] ? byScore[byScore.length - 1].team : null;
+
+    // 最速回答チーム：スピードボーナスの平均（1人あたり）が最も高い＝正解した問題への反応が速いチーム
+    const bySpeed = Object.entries(teams)
+      .map(([team, t]) => ({ team, avgSpeed: t.count ? t.totalSpeedBonus / t.count : 0 }))
+      .sort((a, b) => b.avgSpeed - a.avgSpeed);
+    const fastest = bySpeed[0] ? bySpeed[0].team : champion;
 
     db.ref(`rooms/${roomCode}/state`).update({
       phase: "ended",
