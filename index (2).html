@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>大画面表示</title>
+<link rel="stylesheet" href="../shared/style.css">
+</head>
+<body class="screen-mode">
+<div class="wrap" id="app">
+  <h1>🎉 クイズ大会</h1>
+  <div id="content"></div>
+</div>
+
+<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-database-compat.js"></script>
+<script src="../shared/firebase-config.js"></script>
+<script>
+const content = document.getElementById("content");
+const params = new URLSearchParams(location.search);
+const roomCode = params.get("room");
+
+// 参加者・進行役画面と時刻のズレが出ないよう、Firebaseサーバーとの時刻差を取得しておく
+let serverTimeOffset = 0;
+db.ref(".info/serverTimeOffset").on("value", (snap) => {
+  serverTimeOffset = snap.val() || 0;
+});
+function serverNow() {
+  return Date.now() + serverTimeOffset;
+}
+
+if (!roomCode) {
+  content.innerHTML = `<div class="card center"><p>URLの最後に <code>?room=参加コード</code> を付けて開いてください。</p></div>`;
+} else {
+  run();
+}
+
+let timerInterval = null;
+
+function run() {
+  db.ref(`rooms/${roomCode}/state`).on("value", (snap) => {
+    const state = snap.val();
+    if (!state) { content.innerHTML = `<div class="card center"><p>大会が見つかりません。</p></div>`; return; }
+    if (state.phase === "lobby") renderLobby();
+    else if (state.phase === "question") renderQuestion(state);
+    else if (state.phase === "reveal") renderReveal(state);
+    else if (state.phase === "results") renderResults();
+    else if (state.phase === "ended") renderEnded(state);
+  });
+}
+
+function renderLobby() {
+  const joinUrl = location.origin + location.pathname.replace("/screen/", "/play/") + `?room=${roomCode}`;
+  const qrSrc = `https://api.qrserver.com/v1/create-qr-code/?size=320x320&data=${encodeURIComponent(joinUrl)}`;
+  content.innerHTML = `
+    <div class="card center">
+      <p style="font-size:1.3em;">スマホでQRコードを読み取って参加してください</p>
+      <div class="qr-box"><img src="${qrSrc}" width="320" height="320" alt="参加用QRコード"></div>
+      <p style="font-size:2em; font-weight:bold; color:#1f3a5f;">参加コード：${roomCode}</p>
+      <p id="waitCount" class="muted"></p>
+    </div>
+  `;
+  db.ref(`rooms/${roomCode}/players`).on("value", (snap) => {
+    const players = snap.val() || {};
+    const el = document.getElementById("waitCount");
+    if (el) el.textContent = `現在 ${Object.keys(players).length} 人が参加しています`;
+  });
+}
+
+function renderQuestion(state) {
+  const q = state.currentQuestion;
+  const choicesHtml = q.choices.map(c => `<div class="choice-btn">${c}</div>`).join("");
+  content.innerHTML = `
+    <div class="card">
+      <p class="center muted">問題 ${state.qIndex + 1}${q.practice ? "（練習）" : ""}</p>
+      <p class="question-text">${q.question}</p>
+      ${choicesHtml}
+      <div class="timer" id="timerBox">--</div>
+    </div>
+  `;
+  if (timerInterval) clearInterval(timerInterval);
+  const timeLimit = q.timeLimit || 20;
+  const startedAt = state.questionStartedAt || serverNow();
+  timerInterval = setInterval(() => {
+    const remain = Math.max(0, timeLimit - Math.floor((serverNow() - startedAt) / 1000));
+    const box = document.getElementById("timerBox");
+    if (box) box.textContent = remain + " 秒";
+    if (remain <= 0) clearInterval(timerInterval);
+  }, 200);
+}
+
+function renderReveal(state) {
+  if (timerInterval) clearInterval(timerInterval);
+  const q = state.currentQuestion;
+  db.ref(`rooms/${roomCode}/answers/${state.qIndex}`).once("value", (snap) => {
+    const answers = snap.val() || {};
+    const counts = q.choices.map((_, i) =>
+      Object.values(answers).filter(a => a.choice === i).length
+    );
+    const total = Object.keys(answers).length || 1;
+    const barsHtml = q.choices.map((c, i) => {
+      const pct = Math.round((counts[i] / total) * 100);
+      const isCorrect = i === q.answerIndex;
+      return `
+        <div style="margin:10px 0;">
+          <div>${c} ${isCorrect ? "✅ 正解" : ""}（${counts[i]}人）</div>
+          <div style="background:#e0e6ee; border-radius:8px; overflow:hidden; height:22px;">
+            <div style="width:${pct}%; height:100%; background:${isCorrect ? "#2f9e44" : "#8896ab"};"></div>
+          </div>
+        </div>
+      `;
+    }).join("");
+    content.innerHTML = `
+      <div class="card">
+        <p class="question-text" style="font-size:1.2em;">${q.question}</p>
+        ${barsHtml}
+        <p class="center muted">${q.explanation || ""}</p>
+      </div>
+    `;
+  });
+}
+
+function renderResults() {
+  db.ref(`rooms/${roomCode}/players`).once("value", (snap) => {
+    const players = snap.val() || {};
+    const list = Object.values(players);
+    list.sort((a, b) => (b.score || 0) - (a.score || 0));
+    const top5 = list.slice(0, 5);
+    const rows = top5.map((p, i) =>
+      `<div class="rank-row"><span class="pos">${i + 1}位</span><span>${p.name}（${p.team}）</span><span class="score">${p.score || 0}点</span></div>`
+    ).join("");
+
+    const teams = {};
+    list.forEach(p => {
+      if (!teams[p.team]) teams[p.team] = { total: 0, count: 0 };
+      teams[p.team].total += (p.score || 0);
+      teams[p.team].count += 1;
+    });
+    const teamRows = Object.entries(teams)
+      .map(([team, t]) => ({ team, avg: t.count ? Math.round(t.total / t.count) : 0 }))
+      .sort((a, b) => b.avg - a.avg)
+      .map((t, i) => `<div class="rank-row"><span class="pos">${i + 1}位</span><span>${t.team}</span><span class="score">平均${t.avg}点</span></div>`)
+      .join("");
+
+    content.innerHTML = `
+      <div class="card">
+        <h2 class="center">個人ランキング（上位5名）</h2>
+        ${rows}
+      </div>
+      <div class="card">
+        <h2 class="center">チームランキング</h2>
+        ${teamRows}
+      </div>
+    `;
+  });
+}
+
+function renderEnded(state) {
+  const a = state.finalTeamResults || {};
+  content.innerHTML = `
+    <div class="card center">
+      <h2>お疲れさまでした！🎊</h2>
+      <p style="font-size:1.4em;">🏆 優勝チーム：<strong>${a.champion || "-"}</strong></p>
+      <p style="font-size:1.4em;">⚡ 最速回答チーム：<strong>${a.fastest || "-"}</strong></p>
+      <p style="font-size:1.4em;">😄 わきあいあい賞：<strong>${a.mostFun || "-"}</strong></p>
+      <p class="muted">ご参加ありがとうございました！</p>
+    </div>
+  `;
+}
+</script>
+</body>
+</html>
